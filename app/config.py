@@ -10,26 +10,31 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class OpenAIConfig(BaseSettings):
+class OpenAIBaseConfig(BaseSettings):
+    """OpenAI 基础配置，用于主配置和嵌套配置共享"""
+    
+    api_key: str = Field(default="sk-f4e0893a18344bcbb696fc3dbe3cda32", description="OpenAI API key")
+    base_url: str = Field(
+        default="http://localhost:8045/v1",
+        description="OpenAI API base URL (for compatible APIs)"
+    )
+    model: str = Field(
+        default="gemini-2.5-flash",
+        description="Default model to use"
+    )
+    max_tokens: int = Field(default=4096, description="Maximum tokens per request")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+
+
+class OpenAIConfig(OpenAIBaseConfig):
     """OpenAI API configuration settings."""
     
     model_config = SettingsConfigDict(env_prefix="OPENAI_")
     
-    api_key: str = Field(default="", description="OpenAI API key")
-    base_url: str = Field(
-        default="https://api.openai.com/v1",
-        description="OpenAI API base URL (for compatible APIs)"
-    )
-    model: str = Field(
-        default="gpt-4o-mini",
-        description="Default model to use"
-    )
     embedding_model: str = Field(
         default="text-embedding-3-small",
         description="Embedding model for semantic search"
     )
-    max_tokens: int = Field(default=4096, description="Maximum tokens per request")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     timeout: float = Field(default=60.0, description="Request timeout in seconds")
     max_retries: int = Field(default=3, description="Maximum retry attempts")
 
@@ -177,30 +182,37 @@ class ServerConfig(BaseSettings):
     )
 
 
-class Settings(BaseSettings):
+class Settings(OpenAIBaseConfig):
     """Main application settings."""
-    
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        extra="ignore"
+        extra="ignore",
+        env_nested_delimiter="__"  # 支持嵌套配置
     )
-    
+
     app_name: str = "Chat Agent Framework"
     app_version: str = "1.0.0"
     environment: Literal["development", "staging", "production"] = "development"
+    debug: bool = Field(default=True, description="Debug mode")
     
+    # 嵌套配置
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     queue: MessageQueueConfig = Field(default_factory=MessageQueueConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
-    
-    @field_validator("environment", mode="before")
+
+    @field_validator("debug", mode="before")
     @classmethod
-    def validate_environment(cls, v: str) -> str:
-        return v.lower() if v else "development"
+    def validate_debug(cls, v: str | bool) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes", "on")
+        return False
 
 
 @lru_cache
