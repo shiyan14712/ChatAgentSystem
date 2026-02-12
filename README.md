@@ -18,7 +18,7 @@
 
 ## 1 目录
 
-- [功能特性](#功能特性)
+- [功能特性](#2)
 - [系统架构](#系统架构)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
@@ -57,7 +57,20 @@
 | **多层异常处理** | 完善的错误捕获和恢复机制，保证系统稳定性 |
 | **工具调用** | 支持并行工具执行，可扩展自定义工具 |
 
-### 📨 消息处理管道
+### 任务进度追踪（Todos）
+
+作为`tools`编排在工具里
+
+| 特性 | 描述 |
+|------|------|
+| **LLM 自主决策开启** | 通过 system prompt 注入 + `manage_todo_list` 工具，LLM 自行判断何时启用多步骤任务追踪 |
+| **三态步骤管理** | 每个步骤支持 `pending` → `running` → `completed` 三态流转，同一时间最多一个 `running` |
+| **SSE 实时推送** | 每次 todo 变更自动通过 SSE 推送完整快照（`type="todo_list"`），前端无需轮询 |
+| **PostgreSQL 持久化** | 独立两张表（`session_todo_lists` / `session_todo_items`）+ 乐观锁 revision，支持页面刷新恢复 |
+| **REST 恢复端点** | `GET /sessions/{id}/todo-list` 供前端刷新时一次性拉取最新 todo 状态 |
+| **与普通会话兼容** | 无 todo 的会话不受影响，todo 为可选附加能力，不改变原有对话链路 |
+
+### 消息处理管道
 
 | 特性 | 描述 |
 |------|------|
@@ -100,6 +113,7 @@
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │                    API Layer                              │   │
 │  │  /chat/  /chat/stream  /sessions/  /chat/title           │   │
+│  │  /sessions/{id}/todo-list                                │   │
 │  └────────────────────────────┬─────────────────────────────┘   │
 │                               ▼                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
@@ -390,6 +404,156 @@ TOOLS_DISCOVERY_FAIL_FAST=false            # 单个 provider 失败时是否直�
 4. `TOOLS_DISCOVERY_FAIL_FAST` 是否导致启动直接失败
 5. 启动日志中是否出现 `Tool discovery completed` / `External tool entry point failed`
 
+### 5) Todo 任务进度追踪（核心实现）
+
+Todo 功能允许 LLM 在处理多步骤任务时，自动创建并维护一份可视化的任务清单，前端可实时展示步骤进度。
+
+#### Todo 如何被开启
+
+Todo 功能**不是**由用户手动开关，而是由 LLM 自主判断是否需要：
+
+1. **System Prompt 注入**：`ChatAgent` 在每次对话时，将 `TODO_SYSTEM_PROMPT` 追加到系统消息中，告知 LLM 拥有 `manage_todo_list` 工具。
+2. **LLM 自主调用**：当 LLM 判断当前任务需要多步骤完成（如多阶段分析、批量操作等），它会自行发起 `manage_todo_list` 工具调用。
+3. **工具拦截**：`ChatAgent` 在处理工具调用时，将 `manage_todo_list` 从普通工具中分离，单独路由到 `TodoService`，不经过 `ToolExecutor`。
+
+```python
+# core.py 中的 system prompt 片段
+TODO_SYSTEM_PROMPT = """你拥有一个名为 manage_todo_list 的工具。
+当用户的请求需要多步骤才能完成时（例如：多阶段分析、多文件操作、复杂计划执行等），
+你**必须**在开始工作前先调用 manage_todo_list 来创建任务清单。
+
+使用规则：
+1. 在开始多步骤任务前，调用 manage_todo_list 创建完整的步骤清单（所有步骤 pending，第一步设为 running）。
+2. 每完成一个步骤后，再次调用 manage_todo_list，将已完成的步骤标记为 completed，下一步标记为 running。
+3. 每次调用都必须发送**完整列表**（不是增量更新）。
+4. 同一时间最多只有一个步骤处于 running 状态。
+5. 对于简单的单步任务（如简单问答、翻译等），**不要**调用此工具。
+"""
+```
+
+触发时机示意图：
+
+```
+用户发送消息
+  │
+  ▼
+ChatAgent.chat_stream()
+  │
+  ├─ 注入 TODO_SYSTEM_PROMPT 到 system 消息
+  ├─ 注册 manage_todo_list 到工具列表
+  │
+  ▼
+LLM 返回响应
+  │
+  ├─ 若包含 manage_todo_list 调用 ──→ 拦截，路由到 TodoService
+  │                                      │
+  │                                      ├─ 写入 / 更新数据库
+  │                                      ├─ SSE 推送 todo 快照
+  │                                      └─ 返回确认给 LLM
+  │
+  └─ 其他工具调用 ──→ 正常走 ToolExecutor
+```
+
+#### 有 Todos 和没有 Todos 的会话区别
+
+| 维度 | 普通会话 | 含 Todos 的会话 |
+|------|---------|----------------|
+| **数据库** | 仅 `sessions` + `messages` 表 | 额外关联 `session_todo_lists` + `session_todo_items` 表 |
+| **SSE 事件** | `session` / `thinking` / `content` / `done` | 额外推送 `todo_list` 类型事件 |
+| **工具调用** | 所有工具走 `ToolExecutor` | `manage_todo_list` 被拦截走 `TodoService`，其余不变 |
+| **System Prompt** | 原有 system 消息 | 额外追加 `TODO_SYSTEM_PROMPT` 段落 |
+| **REST 端点** | 无 todo 相关 | `GET /sessions/{id}/todo-list` 返回快照 |
+| **SessionModel 关系** | `todo_list` 为 `None` | `todo_list` 指向 `TodoListModel` 实例 |
+
+对于前端：
+- 普通会话：`StreamChunk` 中 `todo_list` 字段始终为 `null`，前端不显示 todo 面板
+- 含 Todos 会话：收到 `type="todo_list"` 事件时渲染任务列表；页面刷新后通过 REST 恢复
+
+#### 持久化设计
+
+Todo 数据存储在两张 PostgreSQL 表中，与 `sessions` 表通过外键关联：
+
+```
+sessions (1) ──── (0..1) session_todo_lists (1) ──── (N) session_todo_items
+```
+
+**session_todo_lists 表：**
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| `id` | UUID PK | 主键 |
+| `session_id` | UUID FK UNIQUE | 关联 sessions，一对一 |
+| `title` | VARCHAR(255) | 任务清单标题 |
+| `revision` | INTEGER | 乐观锁版本号，每次写操作 +1 |
+| `status` | VARCHAR(50) | `active` / `completed` / `archived` |
+| `created_at` / `updated_at` | TIMESTAMPTZ | 时间戳 |
+
+**session_todo_items 表：**
+
+| 列 | 类型 | 说明 |
+|----|------|------|
+| `id` | UUID PK | 主键 |
+| `todo_list_id` | UUID FK | 关联 session_todo_lists |
+| `label` | VARCHAR(500) | 步骤描述 |
+| `status` | VARCHAR(50) | `pending` / `running` / `completed` |
+| `order_index` | INTEGER | 排序序号 |
+| `created_at` / `updated_at` | TIMESTAMPTZ | 时间戳 |
+
+关键约束：
+- `session_id` 上建立 UNIQUE 索引，保证每个会话最多一个 todo-list
+- 外键使用 `ON DELETE CASCADE`，删除会话时自动级联清除 todo 数据
+- `revision` 用于并发控制：前端可用此字段判断是否需要更新渲染
+
+#### SSE 推送协议
+
+每次 todo 变更，后端通过 SSE 推送完整 todo 快照（非增量）：
+
+```json
+data: {
+  "session_id": "550e8400-...",
+  "type": "todo_list",
+  "delta": "",
+  "todo_list": {
+    "id": "a1b2c3d4-...",
+    "title": "数据分析流程",
+    "items": [
+      {"id": "...", "label": "收集数据源", "status": "completed", "order_index": 1},
+      {"id": "...", "label": "数据清洗",   "status": "running",   "order_index": 2},
+      {"id": "...", "label": "建模评估",   "status": "pending",   "order_index": 3}
+    ],
+    "revision": 3,
+    "updated_at": "2026-02-12T10:30:00Z"
+  }
+}
+```
+
+#### 服务层架构
+
+```
+ChatAgent (core.py)
+  │  拦截 manage_todo_list 工具调用
+  ▼
+TodoService (services/todo_service.py)
+  │  业务逻辑 + SSE 广播
+  ▼
+TodoRepository (database/todo_repository.py)
+  │  CRUD + revision 管理
+  ▼
+PostgreSQL (session_todo_lists + session_todo_items)
+```
+
+`TodoService` 关键方法：
+
+| 方法 | 说明 |
+|------|------|
+| `create_todo_list(session_id, title, labels)` | 创建清单，首项自动 running |
+| `create_or_replace_with_items(session_id, title, items)` | 用 LLM 给出的精确状态创建/替换清单 |
+| `advance_step(session_id)` | running→completed，下一个 pending→running |
+| `set_item_status(session_id, item_id, status)` | 设置指定项状态 |
+| `complete_all(session_id)` | 标记所有项为 completed |
+| `clear(session_id)` | 删除整个 todo-list |
+| `get_todo_list(session_id)` | 只读查询（无广播） |
+
 ---
 
 ## 6 APIs
@@ -490,6 +654,35 @@ GET /api/v1/sessions/{session_id}
 ```http
 DELETE /api/v1/sessions/{session_id}
 ```
+
+### Todo 接口
+
+#### 获取会话 Todo 列表
+
+```http
+GET /api/v1/sessions/{session_id}/todo-list
+```
+
+**响应 (200):**
+```json
+{
+  "id": "a1b2c3d4-...",
+  "title": "数据分析流程",
+  "items": [
+    {"id": "...", "label": "收集数据源", "status": "completed", "order_index": 1},
+    {"id": "...", "label": "数据清洗",   "status": "running",   "order_index": 2},
+    {"id": "...", "label": "建模评估",   "status": "pending",   "order_index": 3}
+  ],
+  "revision": 3,
+  "updated_at": "2026-02-12T10:30:00Z"
+}
+```
+
+**其他响应码:**
+- `204 No Content` — 该会话没有 todo-list
+- `404 Not Found` — session_id 不存在
+
+> 此端点用于前端页面刷新或切换会话时恢复 todo 状态。实时更新通过 `/chat/stream` SSE 的 `todo_list` 事件获取。
 
 ---
 

@@ -212,10 +212,11 @@ class StreamChunk(BaseModel):
     
     session_id: UUID = Field(description="Session ID")
     delta: str = Field(default="", description="Content delta")
-    type: str = Field(description="Chunk type: content, thinking, tool_call, done, error")
+    type: str = Field(description="Chunk type: content, thinking, tool_call, todo_list, done, error")
     tool_calls: list[dict[str, Any]] | None = Field(default=None)
     thinking: str | None = Field(default=None, description="Thinking content")
     is_thinking_complete: bool = Field(default=False)
+    todo_list: "TodoList | None" = Field(default=None, description="Full todo list snapshot")
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -259,3 +260,34 @@ class ErrorResponse(BaseModel):
     error: str = Field(description="Error message")
     code: str = Field(description="Error code")
     details: dict[str, Any] | None = Field(default=None)
+
+
+# ---------------------------------------------------------------
+# Todo-list schemas
+# ---------------------------------------------------------------
+
+class TodoItemStatus(str, Enum):
+    """Three-state status expected by the frontend."""
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+
+
+class TodoItem(BaseModel):
+    """A single todo item."""
+    id: str = Field(default_factory=lambda: str(uuid4()), description="Item UUID")
+    label: str = Field(description="Short description")
+    status: TodoItemStatus = Field(default=TodoItemStatus.PENDING)
+    order_index: int = Field(default=0, description="Display order")
+
+
+class TodoList(BaseModel):
+    """Full todo list snapshot for a session."""
+    id: str = Field(default_factory=lambda: str(uuid4()), description="TodoList UUID")
+    title: str = Field(default="", description="Overall task title")
+    items: list[TodoItem] = Field(default_factory=list, description="Ordered items")
+    revision: int = Field(default=1, description="Monotonically increasing version")
+    updated_at: str = Field(
+        default_factory=lambda: datetime.utcnow().isoformat() + "Z",
+        description="ISO8601 timestamp",
+    )

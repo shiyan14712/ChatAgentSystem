@@ -11,6 +11,8 @@ from structlog import get_logger
 from app.agent.core import ChatAgent
 from app.config import get_settings
 from app.database import SessionRepository, init_db, close_db, get_session_factory
+from app.database.todo_repository import TodoRepository
+from app.services.todo_service import TodoService
 
 logger = get_logger()
 settings = get_settings()
@@ -37,7 +39,10 @@ async def agent_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize database
     try:
         await init_db()
-        repository = SessionRepository(get_session_factory())
+        sf = get_session_factory()
+        repository = SessionRepository(sf)
+        todo_repo = TodoRepository(sf)
+        todo_service = TodoService(todo_repo)
         logger.info("Database persistence enabled")
     except Exception as e:
         logger.warning(
@@ -45,9 +50,10 @@ async def agent_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             error=str(e),
         )
         repository = None
+        todo_service = None
     
     # Create and start agent
-    _agent = ChatAgent(repository=repository)
+    _agent = ChatAgent(repository=repository, todo_service=todo_service)
     await _agent.start()
     
     logger.info("Agent started successfully")

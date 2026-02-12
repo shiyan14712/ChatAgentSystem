@@ -25,6 +25,8 @@ from app.models.schemas import (
     MessageRole,
     MessageStatus,
     StreamChunk,
+    TodoItem,
+    TodoItemStatus,
 )
 
 logger = get_logger()
@@ -67,12 +69,14 @@ class AgentLoop:
         client: AsyncOpenAI,
         memory_manager: MemoryManager,
         message_queue: PriorityMessageQueue,
-        pipeline: MessagePipeline | None = None
+        pipeline: MessagePipeline | None = None,
+        todo_service: Any | None = None,
     ):
         self.client = client
         self.memory = memory_manager
         self.queue = message_queue
         self.pipeline = pipeline or self._create_default_pipeline()
+        self.todo_service = todo_service
         
         # Configuration
         self.config = settings.agent
@@ -533,17 +537,55 @@ class AgentLoop:
         self,
         tool_calls: list[dict]
     ) -> list[dict]:
-        """Execute tool calls."""
+        """Execute tool calls (with special handling for manage_todo_list)."""
+        import json as _json
+
         results = []
-        
+
         for tc in tool_calls:
-            # Placeholder for tool execution
-            # In real implementation, this would call actual tools
-            results.append({
-                "tool_call_id": tc["id"],
-                "content": f"Tool {tc['function']['name']} executed"
-            })
-        
+            func_name = tc.get("function", {}).get("name", "")
+
+            if func_name == "manage_todo_list" and self.todo_service is not None:
+                # Handle todo tool call via TodoService
+                raw_args = tc.get("function", {}).get("arguments", "{}")
+                try:
+                    args = _json.loads(raw_args)
+                except _json.JSONDecodeError:
+                    results.append({
+                        "tool_call_id": tc["id"],
+                        "content": '{"ok":false,"error":"Invalid JSON arguments"}',
+                    })
+                    continue
+
+                title = args.get("title", "")
+                items_raw = args.get("items", [])
+                labels = [it.get("label", "") for it in items_raw]
+
+                try:
+                    snapshot = await self.todo_service.create_todo_list(
+                        session_id=None,  # will be set from context
+                        title=title,
+                        labels=labels,
+                    )
+                    results.append({
+                        "tool_call_id": tc["id"],
+                        "content": _json.dumps({
+                            "ok": True,
+                            "message": f"Todo list '{title}' saved with {len(labels)} items.",
+                        }),
+                    })
+                except Exception as e:
+                    results.append({
+                        "tool_call_id": tc["id"],
+                        "content": _json.dumps({"ok": False, "error": str(e)}),
+                    })
+            else:
+                # Placeholder for regular tool execution
+                results.append({
+                    "tool_call_id": tc["id"],
+                    "content": f"Tool {func_name} executed",
+                })
+
         return results
     
     async def _create_checkpoint(

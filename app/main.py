@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.openapi.docs import get_swagger_ui_html
 
-from app.api import chat_router, session_router
+from app.api import chat_router, session_router, todo_router
 from app.config import get_settings
 from app.services import agent_lifespan
 
@@ -103,6 +103,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # Include routers
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(session_router, prefix="/api/v1")
+app.include_router(todo_router, prefix="/api/v1")
 
 
 # Health check endpoint

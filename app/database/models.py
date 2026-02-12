@@ -67,9 +67,94 @@ class SessionModel(Base):
         order_by="MessageModel.created_at",
         lazy="selectin",
     )
+    todo_list: Mapped["TodoListModel | None"] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+        uselist=False,
+        lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return f"<Session {self.id} title={self.title!r}>"
+
+
+class TodoListModel(Base):
+    """Persistent todo list bound to a session (0 or 1 per session)."""
+
+    __tablename__ = "session_todo_lists"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50), default="active", nullable=False
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now(), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Relationships
+    session: Mapped["SessionModel"] = relationship(back_populates="todo_list")
+    items: Mapped[list["TodoItemModel"]] = relationship(
+        back_populates="todo_list",
+        cascade="all, delete-orphan",
+        order_by="TodoItemModel.order_index",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<TodoList {self.id} session={self.session_id} rev={self.revision}>"
+
+
+class TodoItemModel(Base):
+    """A single item in a todo list."""
+
+    __tablename__ = "session_todo_items"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    todo_list_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("session_todo_lists.id", ondelete="CASCADE"),
+        index=True,
+    )
+    label: Mapped[str] = mapped_column(String(500), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50), default="pending", nullable=False
+    )
+    order_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=func.now(), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # Relationships
+    todo_list: Mapped["TodoListModel"] = relationship(back_populates="items")
+
+    def __repr__(self) -> str:
+        return f"<TodoItem {self.id} label={self.label!r} status={self.status}>"
 
 
 class MessageModel(Base):
