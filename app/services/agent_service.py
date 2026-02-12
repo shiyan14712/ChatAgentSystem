@@ -10,6 +10,7 @@ from structlog import get_logger
 
 from app.agent.core import ChatAgent
 from app.config import get_settings
+from app.database import SessionRepository, init_db, close_db, get_session_factory
 
 logger = get_logger()
 settings = get_settings()
@@ -33,8 +34,20 @@ async def agent_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     
     logger.info("Initializing agent...")
     
+    # Initialize database
+    try:
+        await init_db()
+        repository = SessionRepository(get_session_factory())
+        logger.info("Database persistence enabled")
+    except Exception as e:
+        logger.warning(
+            "Database initialization failed — running in memory-only mode",
+            error=str(e),
+        )
+        repository = None
+    
     # Create and start agent
-    _agent = ChatAgent()
+    _agent = ChatAgent(repository=repository)
     await _agent.start()
     
     logger.info("Agent started successfully")
@@ -45,5 +58,8 @@ async def agent_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("Shutting down agent...")
     await _agent.stop()
     _agent = None
+    
+    # Close database
+    await close_db()
     
     logger.info("Agent stopped")

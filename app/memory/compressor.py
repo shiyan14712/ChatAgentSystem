@@ -117,11 +117,11 @@ class SummaryCompressor(CompressionStrategy):
         self,
         client: AsyncOpenAI,
         token_counter: TokenCounter,
-        model: str = "gpt-4o-mini"
+        model: str | None = None,
     ):
         self.client = client
         self.token_counter = token_counter
-        self.model = model
+        self.model = model or settings.openai.model
         self.scorer = ImportanceScorer()
     
     async def compress(
@@ -301,12 +301,13 @@ class ContextCompressor:
     def __init__(
         self,
         client: AsyncOpenAI,
-        model: str = "gpt-4o-mini"
+        model: str | None = None,
     ):
         self.client = client
-        self.token_counter = TokenCounter(model)
+        resolved_model = model or settings.openai.model
+        self.token_counter = TokenCounter(resolved_model)
         self.summary_compressor = SummaryCompressor(
-            client, self.token_counter, model
+            client, self.token_counter, resolved_model
         )
         self.settings = settings.memory
         

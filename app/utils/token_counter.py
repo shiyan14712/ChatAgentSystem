@@ -11,12 +11,18 @@ from structlog import get_logger
 logger = get_logger()
 
 
+def _default_model() -> str:
+    """Resolve the default model name from application settings."""
+    from app.config import get_settings
+    return get_settings().openai.model
+
+
 class TokenCounter:
     """Token counting utility using tiktoken."""
     
-    def __init__(self, model: str = "gpt-4o"):
-        self.model = model
-        self._encoding = self._get_encoding(model)
+    def __init__(self, model: str | None = None):
+        self.model = model or _default_model()
+        self._encoding = self._get_encoding(self.model)
     
     @functools.lru_cache(maxsize=10)
     def _get_encoding(self, model: str) -> tiktoken.Encoding:
@@ -118,7 +124,7 @@ class TokenCounter:
 _token_counter: TokenCounter | None = None
 
 
-def get_token_counter(model: str = "gpt-4o") -> TokenCounter:
+def get_token_counter(model: str | None = None) -> TokenCounter:
     """Get or create a token counter instance."""
     global _token_counter
     if _token_counter is None or _token_counter.model != model:

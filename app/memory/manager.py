@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 from structlog import get_logger
 
 from app.config import get_settings
+from app.database.repository import SessionRepository
 from app.memory.compressor import ContextCompressor
 from app.memory.context import ContextWindow
 from app.models.schemas import (
@@ -39,14 +40,16 @@ class MemoryManager:
     def __init__(
         self,
         openai_client: AsyncOpenAI,
-        model: str = "gpt-4o"
+        model: str | None = None,
+        repository: SessionRepository | None = None,
     ):
         self.client = openai_client
-        self.model = model
-        self.token_counter = TokenCounter(model)
+        self.model = model or settings.openai.model
+        self.token_counter = TokenCounter(self.model)
         self.compressor = ContextCompressor(openai_client, model)
+        self.repository = repository
         
-        # Session storage
+        # Session storage (in-memory cache, backed by DB when repository is provided)
         self._sessions: dict[UUID, ConversationSession] = {}
         self._context_windows: dict[UUID, ContextWindow] = {}
         
@@ -97,6 +100,13 @@ class MemoryManager:
         self._sessions[session.id] = session
         self._context_windows[session.id] = context_window
         
+        # Persist to database
+        if self.repository:
+            try:
+                await self.repository.create_session(session)
+            except Exception as e:
+                logger.error("Failed to persist session", error=str(e))
+        
         logger.info(
             "Session created",
             session_id=str(session.id),
@@ -106,8 +116,36 @@ class MemoryManager:
         return session
     
     async def get_session(self, session_id: UUID) -> ConversationSession | None:
-        """Get an existing session."""
-        return self._sessions.get(session_id)
+        """Get an existing session (memory cache first, then database)."""
+        session = self._sessions.get(session_id)
+        if session:
+            return session
+        
+        # Try loading from database
+        if self.repository:
+            try:
+                session = await self.repository.get_session(session_id)
+                if session:
+                    # Restore into memory cache and rebuild context window
+                    self._sessions[session.id] = session
+                    context_window = ContextWindow(
+                        max_tokens=self.config.max_context_tokens,
+                        model=self.model,
+                    )
+                    for msg in session.messages:
+                        priority = self._calculate_priority(msg)
+                        context_window.add_message(
+                            msg,
+                            priority=priority,
+                            lock=(msg.role == MessageRole.SYSTEM),
+                        )
+                    self._context_windows[session.id] = context_window
+                    logger.debug("Session loaded from DB", session_id=str(session_id))
+                    return session
+            except Exception as e:
+                logger.error("Failed to load session from DB", error=str(e))
+        
+        return None
     
     async def add_message(
         self,
@@ -146,6 +184,13 @@ class MemoryManager:
         # Check if compression needed
         if context.usage_ratio >= self.config.compression_threshold:
             await self._trigger_compression(session_id)
+        
+        # Persist message to database
+        if self.repository:
+            try:
+                await self.repository.save_message(session_id, message)
+            except Exception as e:
+                logger.error("Failed to persist message", error=str(e))
         
         return added
     
@@ -198,6 +243,13 @@ class MemoryManager:
         if session_id in self._context_windows:
             del self._context_windows[session_id]
         
+        # Delete from database
+        if self.repository:
+            try:
+                await self.repository.delete_session(session_id)
+            except Exception as e:
+                logger.error("Failed to delete session from DB", error=str(e))
+        
         logger.info("Session deleted", session_id=str(session_id))
         return True
     
@@ -207,6 +259,14 @@ class MemoryManager:
         page_size: int = 20
     ) -> tuple[list[ConversationSession], int]:
         """List all sessions with pagination."""
+        # Prefer database for complete / durable listing
+        if self.repository:
+            try:
+                return await self.repository.list_sessions(page, page_size)
+            except Exception as e:
+                logger.error("Failed to list sessions from DB", error=str(e))
+        
+        # Fallback: in-memory
         sessions = sorted(
             self._sessions.values(),
             key=lambda s: s.updated_at,
@@ -261,6 +321,15 @@ class MemoryManager:
         
         # Update session messages
         session.messages = compressed
+        
+        # Persist compressed state to database
+        if self.repository:
+            try:
+                await self.repository.replace_session_messages(
+                    session_id, compressed, session.summary
+                )
+            except Exception as e:
+                logger.error("Failed to persist compression", error=str(e))
         
         # Notify callbacks
         for callback in self._on_compression_callbacks:

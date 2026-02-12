@@ -15,6 +15,12 @@ from app.utils.token_counter import TokenCounter
 logger = get_logger()
 
 
+def _default_model() -> str:
+    """Resolve the default model name from application settings."""
+    from app.config import get_settings
+    return get_settings().openai.model
+
+
 @dataclass
 class ContextSegment:
     """A segment of context with metadata."""
@@ -43,12 +49,12 @@ class ContextWindow:
         self,
         max_tokens: int = 128000,
         reserved_tokens: int = 4096,  # Reserved for response
-        model: str = "gpt-4o"
+        model: str | None = None
     ):
         self.max_tokens = max_tokens
         self.reserved_tokens = reserved_tokens
         self.available_tokens = max_tokens - reserved_tokens
-        self.token_counter = TokenCounter(model)
+        self.token_counter = TokenCounter(model or _default_model())
         
         # Layered storage
         self.hot_segments: list[ContextSegment] = []  # Active context

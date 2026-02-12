@@ -10,9 +10,16 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class OpenAIBaseConfig(BaseSettings):
-    """OpenAI 基础配置，用于主配置和嵌套配置共享"""
-    
+class OpenAIConfig(BaseSettings):
+    """OpenAI API configuration settings."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="OPENAI_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
     api_key: str = Field(default="sk-f4e0893a18344bcbb696fc3dbe3cda32", description="OpenAI API key")
     base_url: str = Field(
         default="http://localhost:8045/v1",
@@ -24,13 +31,6 @@ class OpenAIBaseConfig(BaseSettings):
     )
     max_tokens: int = Field(default=4096, description="Maximum tokens per request")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-
-
-class OpenAIConfig(OpenAIBaseConfig):
-    """OpenAI API configuration settings."""
-    
-    model_config = SettingsConfigDict(env_prefix="OPENAI_")
-    
     embedding_model: str = Field(
         default="text-embedding-3-small",
         description="Embedding model for semantic search"
@@ -41,8 +41,13 @@ class OpenAIConfig(OpenAIBaseConfig):
 
 class MemoryConfig(BaseSettings):
     """Memory and context management configuration."""
-    
-    model_config = SettingsConfigDict(env_prefix="MEMORY_")
+
+    model_config = SettingsConfigDict(
+        env_prefix="MEMORY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
     
     # Token limits
     max_context_tokens: int = Field(
@@ -81,8 +86,13 @@ class MemoryConfig(BaseSettings):
 
 class AgentConfig(BaseSettings):
     """Agent loop and execution configuration."""
-    
-    model_config = SettingsConfigDict(env_prefix="AGENT_")
+
+    model_config = SettingsConfigDict(
+        env_prefix="AGENT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
     
     max_iterations: int = Field(
         default=10,
@@ -114,8 +124,13 @@ class AgentConfig(BaseSettings):
 
 class MessageQueueConfig(BaseSettings):
     """Message queue configuration (Kafka/Redis)."""
-    
-    model_config = SettingsConfigDict(env_prefix="QUEUE_")
+
+    model_config = SettingsConfigDict(
+        env_prefix="QUEUE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
     
     backend: Literal["memory", "redis", "kafka"] = Field(
         default="memory",
@@ -155,8 +170,13 @@ class MessageQueueConfig(BaseSettings):
 
 class DatabaseConfig(BaseSettings):
     """Database configuration."""
-    
-    model_config = SettingsConfigDict(env_prefix="DATABASE_")
+
+    model_config = SettingsConfigDict(
+        env_prefix="DATABASE_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
     
     url: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5432/agent_db",
@@ -169,8 +189,13 @@ class DatabaseConfig(BaseSettings):
 
 class ServerConfig(BaseSettings):
     """Server configuration."""
-    
-    model_config = SettingsConfigDict(env_prefix="SERVER_")
+
+    model_config = SettingsConfigDict(
+        env_prefix="SERVER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
     
     host: str = Field(default="0.0.0.0", description="Server host")
     port: int = Field(default=8000, description="Server port")
@@ -182,22 +207,21 @@ class ServerConfig(BaseSettings):
     )
 
 
-class Settings(OpenAIBaseConfig):
+class Settings(BaseSettings):
     """Main application settings."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
-        env_nested_delimiter="__"  # 支持嵌套配置
     )
 
     app_name: str = "Chat Agent Framework"
     app_version: str = "1.0.0"
     environment: Literal["development", "staging", "production"] = "development"
     debug: bool = Field(default=True, description="Debug mode")
-    
-    # 嵌套配置
+
+    # Nested configs — each reads .env independently with its own env_prefix
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)

@@ -12,6 +12,7 @@ from structlog import get_logger
 from app.agent.executor import ToolExecutor, create_default_executor
 from app.agent.loop import AgentLoop, LoopState
 from app.config import get_settings
+from app.database.repository import SessionRepository
 from app.memory.manager import MemoryManager
 from app.messaging.pipeline import MessagePipeline, create_default_pipeline
 from app.messaging.queue import PriorityMessageQueue, create_message_queue
@@ -60,7 +61,8 @@ class ChatAgent:
         self,
         api_key: str | None = None,
         base_url: str | None = None,
-        model: str | None = None
+        model: str | None = None,
+        repository: SessionRepository | None = None,
     ):
         # Initialize OpenAI client
         self.client = AsyncOpenAI(
@@ -73,7 +75,7 @@ class ChatAgent:
         self.model = model or settings.openai.model
         
         # Initialize components
-        self.memory = MemoryManager(self.client, self.model)
+        self.memory = MemoryManager(self.client, self.model, repository=repository)
         self.queue = create_message_queue(settings.queue.backend)
         self.pipeline = create_default_pipeline()
         self.tool_executor = create_default_executor()
@@ -422,16 +424,20 @@ class ChatAgent:
             if isinstance(msg.content, str)
         ])
         
-        # Generate title
-        prompt = f"""请为以下对话生成一个简短的标题（不超过20个字），只输出标题，不要其他内容：
-
-{context}
-
-标题："""
-
+        # Generate title using system + user message pattern for better
+        # compatibility with various LLM providers (e.g. Gemini)
         response = await self.client.chat.completions.create(
             model=self.model,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": "你是一个标题生成助手。根据用户提供的对话内容，生成一个简短的标题（不超过20个字）。直接输出标题文本，不要加引号、前缀或任何其他内容。"
+                },
+                {
+                    "role": "user",
+                    "content": f"请为以下对话生成标题：\n\n{context}"
+                }
+            ],
             max_tokens=50,
             temperature=0.3,
         )
@@ -441,6 +447,13 @@ class ChatAgent:
         
         # Update session
         session.title = title
+        
+        # Persist title update to database
+        if self.memory.repository:
+            try:
+                await self.memory.repository.update_session(session)
+            except Exception as e:
+                logger.error("Failed to persist title", error=str(e))
         
         return title
     
