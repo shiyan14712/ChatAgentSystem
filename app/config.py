@@ -122,6 +122,34 @@ class AgentConfig(BaseSettings):
     )
 
 
+class ToolConfig(BaseSettings):
+    """Tool discovery and plugin loading configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="TOOLS_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enable_builtin_discovery: bool = Field(
+        default=True,
+        description="Enable discovery of built-in tools from internal package"
+    )
+    enable_entrypoint_discovery: bool = Field(
+        default=True,
+        description="Enable discovery of external tools via Python entry points"
+    )
+    entrypoint_group: str = Field(
+        default="chat_agent_framework.tools",
+        description="Entry-point group name for external tool providers"
+    )
+    discovery_fail_fast: bool = Field(
+        default=False,
+        description="Fail startup if one tool provider fails to load"
+    )
+
+
 class MessageQueueConfig(BaseSettings):
     """Message queue configuration (Kafka/Redis)."""
 
@@ -225,6 +253,7 @@ class Settings(BaseSettings):
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
+    tools: ToolConfig = Field(default_factory=ToolConfig)
     queue: MessageQueueConfig = Field(default_factory=MessageQueueConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)

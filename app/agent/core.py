@@ -154,6 +154,7 @@ class ChatAgent:
             stream=False,
             tools=tools or self.tool_executor.registry.get_openai_tools()
         )
+        max_iterations = settings.agent.max_iterations
         
         # Get or create session
         if session_id:
@@ -167,76 +168,82 @@ class ChatAgent:
         user_msg = Message(role=MessageRole.USER, content=message)
         await self.memory.add_message(session.id, user_msg)
         
-        # Get messages for API call
-        messages = await self.memory.get_openai_messages(session.id)
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        assistant_msg: Message | None = None
+        iterations = 0
         
-        # Call LLM
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=request.tools,
-            max_tokens=settings.openai.max_tokens,
-            temperature=settings.openai.temperature,
-        )
-        
-        # Process response
-        choice = response.choices[0]
-        assistant_msg = Message(
-            role=MessageRole.ASSISTANT,
-            content=choice.message.content or "",
-            tool_calls=[
-                {
-                    "id": tc.id,
-                    "type": tc.type,
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments
+        while iterations < max_iterations:
+            messages = await self.memory.get_openai_messages(session.id)
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=request.tools,
+                max_tokens=settings.openai.max_tokens,
+                temperature=settings.openai.temperature,
+            )
+
+            if response.usage:
+                prompt_tokens += response.usage.prompt_tokens
+                completion_tokens += response.usage.completion_tokens
+                total_tokens += response.usage.total_tokens
+
+            choice = response.choices[0]
+            assistant_msg = Message(
+                role=MessageRole.ASSISTANT,
+                content=choice.message.content or "",
+                tool_calls=[
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
                     }
-                }
-                for tc in (choice.message.tool_calls or [])
-            ] if choice.message.tool_calls else None
-        )
-        await self.memory.add_message(session.id, assistant_msg)
-        
-        # Handle tool calls if any
-        if assistant_msg.tool_calls:
+                    for tc in (choice.message.tool_calls or [])
+                ]
+                if choice.message.tool_calls
+                else None,
+            )
+            await self.memory.add_message(session.id, assistant_msg)
+
+            if not assistant_msg.tool_calls:
+                break
+
             tool_results = await self.tool_executor.execute(
                 assistant_msg.tool_calls,
-                session.id
+                session.id,
             )
-            
+
             for result in tool_results:
                 tool_msg = Message(
                     role=MessageRole.TOOL,
                     content=result.content,
-                    tool_call_id=result.tool_call_id
+                    tool_call_id=result.tool_call_id,
                 )
                 await self.memory.add_message(session.id, tool_msg)
-            
-            # Get final response after tool execution
-            messages = await self.memory.get_openai_messages(session.id)
-            final_response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=settings.openai.max_tokens,
-                temperature=settings.openai.temperature,
+
+            iterations += 1
+
+        if assistant_msg is None:
+            raise RuntimeError("LLM did not return any response")
+
+        if assistant_msg.tool_calls:
+            raise RuntimeError(
+                f"Reached max tool iterations ({max_iterations}) without completion"
             )
-            
-            assistant_msg = Message(
-                role=MessageRole.ASSISTANT,
-                content=final_response.choices[0].message.content or ""
-            )
-            await self.memory.add_message(session.id, assistant_msg)
         
         return ChatResponse(
             session_id=session.id,
             message=assistant_msg,
             status=MessageStatus.COMPLETED,
             usage={
-                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                "total_tokens": response.usage.total_tokens if response.usage else 0
-            }
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            },
         )
     
     async def chat_stream(
@@ -277,120 +284,110 @@ class ChatAgent:
         # Add user message
         user_msg = Message(role=MessageRole.USER, content=message)
         await self.memory.add_message(session.id, user_msg)
-        
-        # Get messages for API call
-        messages = await self.memory.get_openai_messages(session.id)
+        max_iterations = settings.agent.max_iterations
+        available_tools = tools or self.tool_executor.registry.get_openai_tools()
+        iterations = 0
+        pending_tool_calls = False
         
         # Create stream queue
         stream_queue: asyncio.Queue[StreamChunk | None] = asyncio.Queue()
         self._stream_callbacks[session.id] = stream_queue
         
         try:
-            # Start streaming call
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools or self.tool_executor.registry.get_openai_tools(),
-                max_tokens=settings.openai.max_tokens,
-                temperature=settings.openai.temperature,
-                stream=True,
-            )
-            
-            content = ""
-            thinking = ""
-            tool_calls = []
-            
-            async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                
-                if delta:
-                    # Handle thinking/reasoning content
-                    if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                        thinking += delta.reasoning_content
-                        stream_chunk = StreamChunk(
-                            session_id=session.id,
-                            type="thinking",
-                            thinking=delta.reasoning_content
-                        )
-                        yield stream_chunk
-                    
-                    # Handle regular content
-                    if delta.content:
-                        content += delta.content
-                        stream_chunk = StreamChunk(
-                            session_id=session.id,
-                            type="content",
-                            delta=delta.content
-                        )
-                        yield stream_chunk
-                    
-                    # Handle tool calls
-                    if delta.tool_calls:
-                        for tc in delta.tool_calls:
-                            while len(tool_calls) <= tc.index:
-                                tool_calls.append({
-                                    "id": "",
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""}
-                                })
-                            
-                            if tc.id:
-                                tool_calls[tc.index]["id"] = tc.id
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls[tc.index]["function"]["name"] = tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
-            
-            # Save assistant message
-            assistant_msg = Message(
-                role=MessageRole.ASSISTANT,
-                content=content,
-                tool_calls=tool_calls if tool_calls else None,
-                metadata={"thinking": thinking} if thinking else {}
-            )
-            await self.memory.add_message(session.id, assistant_msg)
-            
-            # Handle tool calls if any
-            if tool_calls:
-                tool_results = await self.tool_executor.execute(
-                    tool_calls,
-                    session.id
-                )
-                
-                for result in tool_results:
-                    tool_msg = Message(
-                        role=MessageRole.TOOL,
-                        content=result.content,
-                        tool_call_id=result.tool_call_id
-                    )
-                    await self.memory.add_message(session.id, tool_msg)
-                
-                # Get final response
+            while iterations < max_iterations:
                 messages = await self.memory.get_openai_messages(session.id)
-                final_stream = await self.client.chat.completions.create(
+                stream = await self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
+                    tools=available_tools,
                     max_tokens=settings.openai.max_tokens,
                     temperature=settings.openai.temperature,
                     stream=True,
                 )
-                
-                async for chunk in final_stream:
+
+                content = ""
+                thinking = ""
+                tool_calls = []
+
+                async for chunk in stream:
                     delta = chunk.choices[0].delta if chunk.choices else None
-                    if delta and delta.content:
-                        content += delta.content
-                        yield StreamChunk(
-                            session_id=session.id,
-                            type="content",
-                            delta=delta.content
-                        )
+
+                    if delta:
+                        if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                            thinking += delta.reasoning_content
+                            stream_chunk = StreamChunk(
+                                session_id=session.id,
+                                type="thinking",
+                                thinking=delta.reasoning_content,
+                            )
+                            yield stream_chunk
+
+                        if delta.content:
+                            content += delta.content
+                            stream_chunk = StreamChunk(
+                                session_id=session.id,
+                                type="content",
+                                delta=delta.content,
+                            )
+                            yield stream_chunk
+
+                        if delta.tool_calls:
+                            for tc in delta.tool_calls:
+                                while len(tool_calls) <= tc.index:
+                                    tool_calls.append(
+                                        {
+                                            "id": "",
+                                            "type": "function",
+                                            "function": {"name": "", "arguments": ""},
+                                        }
+                                    )
+
+                                if tc.id:
+                                    tool_calls[tc.index]["id"] = tc.id
+                                if tc.function:
+                                    if tc.function.name:
+                                        tool_calls[tc.index]["function"]["name"] = tc.function.name
+                                    if tc.function.arguments:
+                                        tool_calls[tc.index]["function"]["arguments"] += tc.function.arguments
+
+                assistant_msg = Message(
+                    role=MessageRole.ASSISTANT,
+                    content=content,
+                    tool_calls=tool_calls if tool_calls else None,
+                    metadata={"thinking": thinking} if thinking else {},
+                )
+                await self.memory.add_message(session.id, assistant_msg)
+
+                if not tool_calls:
+                    pending_tool_calls = False
+                    break
+
+                pending_tool_calls = True
+                tool_results = await self.tool_executor.execute(
+                    tool_calls,
+                    session.id,
+                )
+
+                for result in tool_results:
+                    tool_msg = Message(
+                        role=MessageRole.TOOL,
+                        content=result.content,
+                        tool_call_id=result.tool_call_id,
+                    )
+                    await self.memory.add_message(session.id, tool_msg)
+
+                iterations += 1
+
+            if pending_tool_calls:
+                raise RuntimeError(
+                    f"Reached max tool iterations ({max_iterations}) without completion"
+                )
             
             # Send completion
             yield StreamChunk(
                 session_id=session.id,
                 type="done",
-                is_thinking_complete=True
+                is_thinking_complete=True,
             )
             
         finally:
