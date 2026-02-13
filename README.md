@@ -90,6 +90,18 @@
 | **Markdown渲染** | 支持代码高亮、表格、列表等富文本展示 |
 | **响应式设计** | 适配桌面和移动端 |
 
+### 🐍 代码执行沙箱（Code Sandbox）
+
+| 特性 | 描述 |
+|------|------|
+| **Docker 容器隔离** | 每次代码执行在独立 Docker 容器中运行，提供 OS 级安全隔离 |
+| **资源限制** | CPU（50% 单核）、内存（256 MB）、PID（64）、执行时间（30s）严格限制 |
+| **预装科学计算库** | 镜像内置 numpy / pandas / matplotlib / sympy / scipy / requests |
+| **AST 安全预检** | 执行前静态分析，拦截 fork bomb 等资源耗尽模式，预警高风险操作 |
+| **网络隔离** | 默认禁用容器网络，可按需开启 |
+| **输出捕获与截断** | 完整捕获 stdout / stderr，超过 64 KB 自动截断 |
+| **即用即销** | 每次执行创建一次性容器，执行完毕立即销毁，无状态残留 |
+
 ---
 
 ## 3 系统架构
@@ -132,6 +144,14 @@
 │  │  │(Log/Retry)│  │(Redis/Kafka)│ │          │               │   │
 │  │  └──────────┘  └──────────┘  └──────────┘               │   │
 │  └──────────────────────────────────────────────────────────┘   │
+│                             │                                    │
+│  ┌──────────────────────────▼───────────────────────────────┐   │
+│  │             Code Execution Sandbox (Docker)               │   │
+│  │  ┌──────────┐  ┌───────────────┐  ┌──────────────────┐   │   │
+│  │  │ Security │→ │   Container   │→ │ Output Capture   │   │   │
+│  │  │(AST Check)│  │(CPU/Mem/PID)  │  │(stdout/stderr)   │   │   │
+│  │  └──────────┘  └───────────────┘  └──────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────┘   │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ OpenAI API
                             ▼
@@ -149,6 +169,7 @@
 
 - **后端**: Python 3.12+
 - **前端**: Node.js 18+ / Bun
+- **代码沙箱**: Docker Engine 20.10+
 - **可选**: Redis 7+ (用于消息队列), Kafka (用于大规模部署)
 
 **1. 后端启动**
@@ -404,7 +425,217 @@ TOOLS_DISCOVERY_FAIL_FAST=false            # 单个 provider 失败时是否直�
 4. `TOOLS_DISCOVERY_FAIL_FAST` 是否导致启动直接失败
 5. 启动日志中是否出现 `Tool discovery completed` / `External tool entry point failed`
 
-### 5) Todo 任务进度追踪（核心实现）
+### 5) 代码执行沙箱 — Code Sandbox（核心实现）
+
+代码执行沙箱允许 Agent（LLM）在对话过程中自主编写并运行 Python 代码，获取真实计算结果。这与 ChatGPT Code Interpreter / Claude Analysis 的能力对齐。
+
+#### 业界最佳实践：为什么是 Docker？
+
+| 方案 | 隔离级别 | 安全性 | 包管理 | 生产就绪 | 代表产品 |
+|------|----------|--------|--------|----------|----------|
+| `eval()` / `exec()` | 无 | ❌ 极危险 | ❌ | ❌ | — |
+| RestrictedPython | 函数级 | ⚠️ 易绕过 | ❌ | ❌ | — |
+| subprocess + venv | 进程级 | ⚠️ 中等 | ✅ | ⚠️ | — |
+| **Docker 容器** | **OS 级** | **✅ 工业级** | **✅** | **✅** | **ChatGPT / Claude / Gemini** |
+| Firecracker microVM | VM 级 | ✅ 最强 | ✅ | ✅ | AWS Lambda |
+
+**Docker 容器是 Agent 代码执行的行业标准**。ChatGPT Code Interpreter、Claude Analysis、Gemini Code Execution 底层均使用容器化方案。核心优势：
+
+1. **命名空间隔离**：进程、文件系统、网络、IPC 完全隔离，即使代码尝试 `os.system("rm -rf /")` 也只影响容器内部
+2. **cgroup 资源限制**：CPU、内存、PID 数量均可精确控制，防止资源耗尽攻击
+3. **即用即销**：每次执行创建全新容器，执行后立即销毁，无状态泄漏
+4. **可复现环境**：预构建镜像确保每次执行环境一致
+5. **生态成熟**：Docker SDK、镜像管理、日志收集等工具链完善
+
+#### 架构总览
+
+```
+app/sandbox/                          sandbox/
+├── __init__.py                       ├── Dockerfile          # 沙箱镜像定义
+├── models.py     # 数据模型           └── requirements.txt    # 预装包列表
+├── security.py   # AST 安全预检
+├── manager.py    # Docker 容器管理
+└── executor.py   # 高层执行接口
+
+app/agent/tools/internal/
+└── python_executor.py  # BaseTool 实现（自动被 SPI 发现注册）
+```
+
+#### 执行流程（端到端）
+
+```
+用户: "帮我计算 fibonacci(50) 的值"
+  │
+  ▼
+LLM 决定调用 python_executor 工具
+  │  {"code": "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a+b\n    return a\nprint(fib(50))"}
+  │
+  ▼
+PythonExecutorTool.execute(code)
+  │
+  ├─ ① SecurityChecker.validate(code)
+  │     ├─ AST 解析 → 语法检查
+  │     ├─ 模块黑名单检查（ctypes / multiprocessing / signal）
+  │     ├─ 危险调用预警（os.system 等 → 仅 warn，不 block）
+  │     └─ 通过 ✅ / 拒绝 ❌
+  │
+  ├─ ② DockerSandboxManager.execute(request)
+  │     ├─ 创建一次性容器（image: agent-sandbox:latest）
+  │     │     CPU: 50% 单核 | 内存: 256MB | PID: 64 | 网络: 禁用
+  │     ├─ 通过 tar archive 注入代码 → /workspace/main.py
+  │     ├─ 启动容器, python -u /workspace/main.py
+  │     ├─ asyncio.wait_for(container.wait(), timeout=30s)
+  │     ├─ 捕获 stdout / stderr (≤ 64KB)
+  │     └─ force remove 容器
+  │
+  ▼
+ExecutionResult → 格式化返回给 LLM
+  │  "STDOUT:\n12586269025\n\nExecution time: 0.03s"
+  │
+  ▼
+LLM 组织自然语言回复给用户
+```
+
+#### 安全模型（Defense in Depth）
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Layer 1: AST 静态分析（SecurityChecker）                │
+│  • 语法检查（快速失败，避免浪费容器资源）                  │
+│  • 阻止：ctypes / multiprocessing / signal               │
+│  • 预警：os.system / subprocess / eval（仅日志记录）      │
+├─────────────────────────────────────────────────────────┤
+│  Layer 2: Docker 容器隔离                                │
+│  • 独立 PID / Mount / Network / IPC namespace            │
+│  • 非 root 用户 (sandbox)                                │
+│  • security_opt: no-new-privileges                       │
+├─────────────────────────────────────────────────────────┤
+│  Layer 3: cgroup 资源限制                                │
+│  • CPU: 50% 单核 (cpu_quota / cpu_period)                │
+│  • 内存: 256 MB (OOM Kill)                               │
+│  • PID: 64 (防止 fork bomb)                              │
+│  • 执行时间: 30s (asyncio 超时 → container.kill)          │
+├─────────────────────────────────────────────────────────┤
+│  Layer 4: 网络隔离                                       │
+│  • 默认 network_disabled=true                            │
+│  • 可按请求临时开启（需要 pip install 时）                │
+├─────────────────────────────────────────────────────────┤
+│  Layer 5: 输出控制                                       │
+│  • stdout / stderr 截断上限: 64 KB                       │
+│  • 容器文件系统执行后销毁，无持久化                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 容器生命周期
+
+```
+                 create          start        wait/timeout    logs       remove
+                   │               │               │           │           │
+  ┌─────────┐   ┌─▼───────────┐ ┌─▼──────────┐ ┌─▼────────┐ ┌▼────────┐ ┌▼──────────┐
+  │ Request │──▶│  Container  │▶│  Running   │▶│ Exited / │▶│ Output  │▶│ Destroyed │
+  │(code)   │   │  Created    │ │ (python    │ │ Timeout  │ │ Capture │ │ (force rm)│
+  └─────────┘   │  (detach)   │ │  main.py)  │ │ (killed) │ └─────────┘ └───────────┘
+                └─────────────┘ └────────────┘ └──────────┘
+                  tar inject ↗
+                 (put_archive)
+```
+
+代码注入方式：不使用 Volume Mount（有安全风险），而是通过 `container.put_archive()` 将代码打包为 tar 写入容器内 `/workspace/main.py`，实现零宿主机文件系统暴露。
+
+#### Docker 镜像设计
+
+沙箱镜像定义在 `sandbox/Dockerfile`：
+
+```dockerfile
+FROM python:3.12-slim
+
+# 非 root 用户
+RUN groupadd -r sandbox && useradd -r -g sandbox -m -s /bin/bash sandbox
+
+# 预装科学计算包
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# 工作目录
+RUN mkdir -p /workspace && chown sandbox:sandbox /workspace
+WORKDIR /workspace
+USER sandbox
+
+CMD ["python", "-u", "/workspace/main.py"]
+```
+
+预装包列表（`sandbox/requirements.txt`）：
+- **计算**: numpy, pandas, scipy, sympy
+- **可视化**: matplotlib
+- **工具**: requests, python-dateutil, tabulate, pyyaml
+
+#### 包安装策略
+
+| 场景 | 处理方式 |
+|------|----------|
+| 使用预装包 (numpy 等) | 直接 import，零延迟 |
+| 需要额外包 | LLM 传入 `install_packages` 参数 → 容器内 `pip install -q` → 需开启网络 |
+| 安装失败 | stderr 返回错误信息，LLM 可自行调整 |
+
+#### 关键实现细节
+
+**1. 异步 Docker 调用**
+
+Docker SDK 是同步的，通过 `asyncio.to_thread()` 包装保持事件循环响应：
+
+```python
+# manager.py — 所有 Docker 操作均 offload 到线程池
+container = await asyncio.to_thread(self._create_container, request)
+await asyncio.to_thread(self._copy_code_to_container, container, script)
+await asyncio.to_thread(container.start)
+exit_info = await asyncio.wait_for(
+    asyncio.to_thread(container.wait),
+    timeout=request.timeout,   # asyncio 层超时 → container.kill()
+)
+```
+
+**2. 超时处理双保险**
+
+```
+asyncio.wait_for(timeout=30s)     ← 应用层超时（首选）
+         │ TimeoutError
+         ▼
+container.kill()                   ← 强制终止容器进程
+container.remove(force=True)       ← 清理容器（finally 块保证执行）
+```
+
+**3. SPI 自动注册**
+
+`PythonExecutorTool` 放置在 `app/agent/tools/internal/` 包中，框架启动时被 `discover_tools()` 自动扫描注册，无需手动配置。
+
+#### 与现有系统集成点
+
+| 集成点 | 说明 |
+|--------|------|
+| **Tool SPI** | `PythonExecutorTool` 继承 `BaseTool`，自动被发现注册 |
+| **ToolExecutor** | 通过标准 `execute()` 调用链执行，享受并行执行 / 超时 / 错误恢复 |
+| **Config** | `SandboxConfig` 挂载到 `Settings.sandbox`，支持环境变量覆盖 |
+| **System Prompt** | 可在 system prompt 中告知 LLM 拥有代码执行能力 |
+| **SSE 流式** | 工具执行结果作为 `tool` 消息回传，LLM 基于结果继续生成 |
+
+#### 运行前置条件
+
+```bash
+# 1. 确保 Docker 已安装并运行
+docker --version
+docker info
+
+# 2. 首次启动时自动构建沙箱镜像（约 1-2 分钟）
+#    或手动构建：
+docker build -t agent-sandbox:latest ./sandbox/
+
+# 3. 安装 Python Docker SDK
+pip install docker>=7.0.0
+```
+
+> 如果宿主机没有安装 Docker，`CodeExecutor.initialize()` 会抛出明确错误并记录日志，其他工具不受影响。
+
+### 6) Todo 任务进度追踪（核心实现）
 
 Todo 功能允许 LLM 在处理多步骤任务时，自动创建并维护一份可视化的任务清单，前端可实时展示步骤进度。
 
@@ -725,6 +956,20 @@ QUEUE_KAFKA_TOPIC_PREFIX=agent
 # 消息 TTL（当前后端消费链路未启用）
 QUEUE_MESSAGE_TTL=3600  # `【未实现】`
 
+# ============ 代码沙箱配置 ============
+SANDBOX_ENABLED=true                       # 启用代码执行沙箱
+SANDBOX_IMAGE_NAME=agent-sandbox:latest    # Docker 镜像名
+SANDBOX_AUTO_BUILD_IMAGE=true              # 镜像不存在时自动构建
+SANDBOX_EXECUTION_TIMEOUT=30               # 默认执行超时(秒)
+SANDBOX_MAX_EXECUTION_TIMEOUT=120          # 最大允许超时(秒)
+SANDBOX_MAX_OUTPUT_SIZE=65536              # 最大输出字节数 (64KB)
+SANDBOX_MEMORY_LIMIT=256m                  # 容器内存限制
+SANDBOX_CPU_PERIOD=100000                  # CPU CFS 周期(微秒)
+SANDBOX_CPU_QUOTA=50000                    # CPU CFS 配额(50%单核)
+SANDBOX_PIDS_LIMIT=64                      # 容器最大进程数
+SANDBOX_NETWORK_ENABLED=false              # 默认禁用网络
+SANDBOX_CONTAINER_WORKDIR=/workspace       # 容器工作目录
+
 # ============ 数据库配置 ============
 DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/agent_db
 
@@ -889,6 +1134,7 @@ class CustomCompressor(CompressionStrategy):
 | Structlog | 24.4+ | 日志系统 |
 | Redis | 5.2+ | 消息队列(可选) |
 | Aiokafka | 0.12+ | Kafka支持(可选) |
+| Docker SDK | 7.0+ | 代码沙箱容器管理 |
 
 ### 前端
 

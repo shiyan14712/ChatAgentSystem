@@ -150,6 +150,60 @@ class ToolConfig(BaseSettings):
     )
 
 
+class SandboxConfig(BaseSettings):
+    """Docker-based code execution sandbox configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="SANDBOX_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(default=True, description="Enable the code execution sandbox")
+    image_name: str = Field(
+        default="agent-sandbox:latest",
+        description="Docker image name for the sandbox",
+    )
+    auto_build_image: bool = Field(
+        default=True,
+        description="Automatically build the sandbox image on startup if missing",
+    )
+    execution_timeout: float = Field(
+        default=30.0,
+        description="Default execution timeout in seconds",
+    )
+    max_execution_timeout: float = Field(
+        default=120.0,
+        description="Maximum allowed execution timeout in seconds",
+    )
+    max_output_size: int = Field(
+        default=65536,
+        description="Maximum output size in bytes before truncation (64 KB)",
+    )
+    memory_limit: str = Field(
+        default="256m",
+        description="Container memory limit (Docker format, e.g. 256m / 1g)",
+    )
+    cpu_period: int = Field(default=100_000, description="CPU CFS period (microseconds)")
+    cpu_quota: int = Field(
+        default=50_000,
+        description="CPU CFS quota (microseconds) — 50 000 / 100 000 = 50 % of one core",
+    )
+    pids_limit: int = Field(
+        default=64,
+        description="Maximum number of PIDs inside the container",
+    )
+    network_enabled: bool = Field(
+        default=False,
+        description="Allow network access from sandbox containers by default",
+    )
+    container_workdir: str = Field(
+        default="/workspace",
+        description="Working directory inside the sandbox container",
+    )
+
+
 class MessageQueueConfig(BaseSettings):
     """Message queue configuration (Kafka/Redis)."""
 
@@ -254,6 +308,7 @@ class Settings(BaseSettings):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     tools: ToolConfig = Field(default_factory=ToolConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     queue: MessageQueueConfig = Field(default_factory=MessageQueueConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
